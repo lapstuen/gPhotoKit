@@ -3,8 +3,12 @@ import PencilKit
 
 // MARK: - AnnotationTool
 
-public enum AnnotationTool {
-    case select, arrow, line, circle, freehand, highlighter, rectangle, filledCircle, filledRect, number, text, image, paintBackground
+// `: String` gir gratis `.rawValue`/`init?(rawValue:)` som matcher case-navnene
+// eksakt (samme strenger som `toolToString`/`toolFromString` under skriver for
+// hånd til JSON) — brukt av `SVGExporter` for data-tool-attributtet, uten å
+// måtte duplisere en egen streng-mapping der.
+public enum AnnotationTool: String {
+    case select, arrow, line, circle, freehand, highlighter, rectangle, number, text, image, paintBackground, polygon
 }
 
 extension AnnotationTool {
@@ -70,18 +74,42 @@ public struct AnnotationItem {
     public var overlayImage: UIImage?
     public var cornerRadius: CGFloat
     /// Bakgrunnsfyll bak tekst (kun brukt for .text). nil = ingen bakgrunn (gammel oppførsel).
-    /// Fyllingsgraden gjenbruker `opacity`, samme mønster som filledRect/filledCircle.
+    /// Fyllingsgraden gjenbruker `opacity`, samme mønster som sirkel/rektangel/polygon sin fylling.
     public var backgroundColor: UIColor?
+    /// Antall hjørner (kun brukt for .polygon).
+    public var sides: Int
+    /// Stjerne (vekslende ytre/indre radius) i stedet for en regulær polygon.
+    public var isStar: Bool
 
     public init(tool: AnnotationTool, color: UIColor, lineWidth: CGFloat, points: [CGPoint],
                 number: Int = 0, text: String = "", fontSize: CGFloat = 32, fontName: String = "bold",
                 textWidth: CGFloat? = nil, opacity: CGFloat = 0.5, overlayImage: UIImage? = nil, cornerRadius: CGFloat = 0,
-                backgroundColor: UIColor? = nil) {
+                backgroundColor: UIColor? = nil, sides: Int = 5, isStar: Bool = false) {
         self.tool = tool; self.color = color; self.lineWidth = lineWidth; self.points = points
         self.number = number; self.text = text; self.fontSize = fontSize; self.fontName = fontName
         self.textWidth = textWidth; self.opacity = opacity; self.overlayImage = overlayImage; self.cornerRadius = cornerRadius
-        self.backgroundColor = backgroundColor
+        self.backgroundColor = backgroundColor; self.sides = sides; self.isStar = isStar
     }
+}
+
+/// Hjørnene i en regulær polygon (eller stjerne, med vekslende ytre/indre
+/// radius) innskrevet i `rect`. Første hjørne peker rett opp, så f.eks. en
+/// trekant får en naturlig "topp"-orientering. Brukes både til tegning på
+/// lerretet og (senere) til SVG-eksport.
+func polygonVertices(in rect: CGRect, sides: Int, isStar: Bool) -> [CGPoint] {
+    let n = max(3, sides)
+    let count = isStar ? n * 2 : n
+    let center = CGPoint(x: rect.midX, y: rect.midY)
+    let rx = rect.width / 2, ry = rect.height / 2
+    let angleStep = CGFloat.pi * 2 / CGFloat(count)
+    var points: [CGPoint] = []
+    for i in 0..<count {
+        let angle = -CGFloat.pi / 2 + CGFloat(i) * angleStep
+        let radiusScale: CGFloat = (isStar && i % 2 == 1) ? 0.45 : 1.0
+        points.append(CGPoint(x: center.x + rx * radiusScale * cos(angle),
+                              y: center.y + ry * radiusScale * sin(angle)))
+    }
+    return points
 }
 
 // MARK: - AnnotationCanvasView
@@ -98,25 +126,54 @@ open class AnnotationCanvasView: UIView {
     public var currentLineWidth: CGFloat = 14.0
     public var currentFillOpacity: CGFloat = 0.5
     public var currentCornerRadius: CGFloat = 0
+    public var currentPolygonSides: Int = 5
+    public var currentPolygonIsStar: Bool = false
     public var currentTextBackgroundColor: UIColor? = nil
     public var usesPencilKitForFreehand = false
+    /// Slår på "Velg flere"-modus: i denne modusen legger et trykk et objekt
+    /// til/fjerner det fra flervalget i stedet for å starte en dra-operasjon,
+    /// og et dra på tomt lerret tegner et markeringsrektangel (se
+    /// `touchesBegan`/`touchesMoved`/`touchesEnded`) — touch-ekvivalenten til
+    /// Cmd+klikk/Cmd+dra på Mac, som ikke finnes uten tastatur.
+    public var multiSelectMode: Bool = false
     public var onTextTap: ((CGPoint) -> Void)?
-    public var onSelectionChanged: ((Int?) -> Void)?
+    public var onSelectionChanged: ((Set<Int>) -> Void)?
     public var onEditTextItem: ((Int) -> Void)?
     public var onContextMenu: ((_ itemIndex: Int) -> UIContextMenuConfiguration?)?
     public var onContextMenuMac: ((_ itemIndex: Int, _ locationInView: CGPoint) -> Bool)?
+    /// Kalt ved dobbelttrykk på selve Apple Pencil-blyanten (se `UIPencilInteraction`
+    /// under) — men bare hvis brukeren faktisk har "Dobbelttrykk" satt til noe
+    /// appen fanger opp i Innstillinger. Interaksjonen legges til av kalleren
+    /// (samme mønster som `UIContextMenuInteraction` — se `onContextMenu`).
+    public var onPencilDoubleTap: (() -> Void)?
     /// Kalt når et strøk tegnet med `.paintBackground`-verktøyet er ferdig.
     /// Strøket blir ALDRI lagt til i `items` (og dermed aldri i prosjektfilen)
     /// — det er opp til mottakeren å "bake" det permanent inn i bakgrunnsbildet.
     public var onBakeStroke: ((AnnotationItem) -> Void)?
     public var isTextResizeInteractionActive = false
 
-    public private(set) var selectedItemIndex: Int? = nil {
-        didSet { onSelectionChanged?(selectedItemIndex) }
+    /// Flere objekter kan være valgt samtidig (se `multiSelectMode`), men all
+    /// eksisterende ett-objekt-logikk (dra/endre størrelse/tekstredigering/
+    /// dupliser/flytt lag) bruker fortsatt `selectedItemIndex` under, som bare
+    /// gir noe når nøyaktig ett er valgt.
+    public private(set) var selectedIndices: Set<Int> = [] {
+        didSet { onSelectionChanged?(selectedIndices) }
+    }
+
+    public private(set) var selectedItemIndex: Int? {
+        get { selectedIndices.count == 1 ? selectedIndices.first : nil }
+        set { selectedIndices = newValue.map { [$0] } ?? [] }
     }
 
     // Active freehand stroke while the current touch sequence is in progress.
     private var activeFreehandStrokeIndex: Int? = nil
+    /// Markeringsrektangel ("gummistrikk") — satt mens brukeren drar ut et
+    /// område på tomt lerret i "Velg flere"-modus, for å velge alle objekter
+    /// som overlapper det.
+    private var marqueeStart: CGPoint? = nil
+    public private(set) var marqueeRect: CGRect? = nil {
+        didSet { setNeedsDisplay() }
+    }
 
     private var currentPoints: [CGPoint] = []
     private var draggedItemIndex: Int? = nil
@@ -159,6 +216,24 @@ open class AnnotationCanvasView: UIView {
     public func selectItem(at index: Int) {
         guard index < items.count else { return }
         selectedItemIndex = index; setNeedsDisplay()
+    }
+
+    /// "Velg flere"-modus: legger til/fjerner ett objekt i flervalget, i
+    /// stedet for å erstatte hele valget.
+    public func toggleSelection(at index: Int) {
+        guard index < items.count else { return }
+        if selectedIndices.contains(index) { selectedIndices.remove(index) }
+        else { selectedIndices.insert(index) }
+    }
+
+    /// Ren avgrensningsboks for et objekt (ingen padding) — brukt til å
+    /// avgjøre hvilke objekter et markeringsrektangel overlapper, og til
+    /// den enkle flervalg-markeringsrammen i `draw(_:)`.
+    private func itemBounds(_ item: AnnotationItem) -> CGRect? {
+        if item.tool == .text { return textBoundingRect(for: item, canvasWidth: bounds.width) }
+        if item.tool.isFreehandLike { return freehandBounds(item) }
+        guard item.points.count >= 2 else { return nil }
+        return rectFromPoints(item.points[0], item.points[1])
     }
 
     /// Call from Escape handler. Returns true if a freehand stroke was active.
@@ -322,26 +397,48 @@ open class AnnotationCanvasView: UIView {
         guard let ctx = UIGraphicsGetCurrentContext() else { return }
         for (idx, item) in items.enumerated() {
             renderItem(item, in: ctx)
-            if idx == selectedItemIndex {
-                if item.tool == .text {
-                    ctx.setStrokeColor(UIColor.systemYellow.cgColor)
-                    ctx.setLineWidth(2)
-                    ctx.setLineDash(phase: 0, lengths: [6, 3])
-                    let textRect = textBoundingRect(for: item, canvasWidth: bounds.width)
-                    ctx.stroke(textRect.insetBy(dx: -6, dy: -4))
-                    ctx.setLineDash(phase: 0, lengths: [])
-                } else {
-                    drawSelectionHandles(for: item, in: ctx)
-                }
+            guard selectedIndices.contains(idx) else { continue }
+            if selectedIndices.count > 1 {
+                // Flervalg: kun en enkel markeringsramme, ingen dra-håndtak —
+                // dra/endre størrelse gir ikke mening for flere objekter samtidig.
+                drawMultiSelectionHighlight(for: item, in: ctx)
+            } else if item.tool == .text {
+                ctx.setStrokeColor(UIColor.systemYellow.cgColor)
+                ctx.setLineWidth(2)
+                ctx.setLineDash(phase: 0, lengths: [6, 3])
+                let textRect = textBoundingRect(for: item, canvasWidth: bounds.width)
+                ctx.stroke(textRect.insetBy(dx: -6, dy: -4))
+                ctx.setLineDash(phase: 0, lengths: [])
+            } else {
+                drawSelectionHandles(for: item, in: ctx)
             }
         }
         if !currentPoints.isEmpty {
             let nextNum = items.filter { $0.tool == .number }.count + 1
             renderItem(AnnotationItem(tool: currentTool, color: currentColor,
                                       lineWidth: currentLineWidth, points: currentPoints,
-                                      number: nextNum, opacity: currentFillOpacity), in: ctx)
+                                      number: nextNum, opacity: currentFillOpacity,
+                                      sides: currentPolygonSides, isStar: currentPolygonIsStar), in: ctx)
+        }
+        if let marqueeRect {
+            ctx.saveGState()
+            ctx.setFillColor(UIColor.tintColor.withAlphaComponent(0.12).cgColor)
+            ctx.fill(marqueeRect)
+            ctx.setStrokeColor(UIColor.tintColor.cgColor)
+            ctx.setLineWidth(1)
+            ctx.stroke(marqueeRect)
+            ctx.restoreGState()
         }
         updateTextResizeHandleOverlay()
+    }
+
+    private func drawMultiSelectionHighlight(for item: AnnotationItem, in ctx: CGContext) {
+        ctx.saveGState(); defer { ctx.restoreGState() }
+        ctx.setStrokeColor(UIColor.systemYellow.cgColor)
+        ctx.setLineWidth(2)
+        ctx.setLineDash(phase: 0, lengths: [6, 3])
+        guard let itemRect = itemBounds(item) else { return }
+        ctx.stroke(itemRect.insetBy(dx: -8, dy: -8))
     }
 
     private func configureTextResizeHandle() {
@@ -484,7 +581,12 @@ open class AnnotationCanvasView: UIView {
 
         case .circle:
             guard item.points.count == 2 else { return }
-            ctx.strokeEllipse(in: rectFromPoints(item.points[0], item.points[1]))
+            let ellipseRect = rectFromPoints(item.points[0], item.points[1])
+            if item.opacity > 0 {
+                ctx.setFillColor(item.color.withAlphaComponent(item.opacity).cgColor)
+                ctx.fillEllipse(in: ellipseRect)
+            }
+            ctx.strokeEllipse(in: ellipseRect)
 
         case .arrow:
             guard item.points.count == 2 else { return }
@@ -497,28 +599,12 @@ open class AnnotationCanvasView: UIView {
         case .rectangle:
             guard item.points.count == 2 else { return }
             let rrect = rectFromPoints(item.points[0], item.points[1])
-            if item.cornerRadius > 0 {
-                let path = UIBezierPath(roundedRect: rrect, cornerRadius: item.cornerRadius)
-                ctx.addPath(path.cgPath); ctx.strokePath()
-            } else {
-                ctx.stroke(rrect)
+            let roundedPath: UIBezierPath? = item.cornerRadius > 0 ? UIBezierPath(roundedRect: rrect, cornerRadius: item.cornerRadius) : nil
+            if item.opacity > 0 {
+                ctx.setFillColor(item.color.withAlphaComponent(item.opacity).cgColor)
+                if let roundedPath { ctx.addPath(roundedPath.cgPath); ctx.fillPath() } else { ctx.fill(rrect) }
             }
-
-        case .filledCircle:
-            guard item.points.count == 2 else { return }
-            ctx.setFillColor(item.color.withAlphaComponent(item.opacity).cgColor)
-            ctx.fillEllipse(in: rectFromPoints(item.points[0], item.points[1]))
-
-        case .filledRect:
-            guard item.points.count == 2 else { return }
-            ctx.setFillColor(item.color.withAlphaComponent(item.opacity).cgColor)
-            let frrect = rectFromPoints(item.points[0], item.points[1])
-            if item.cornerRadius > 0 {
-                let path = UIBezierPath(roundedRect: frrect, cornerRadius: item.cornerRadius)
-                ctx.addPath(path.cgPath); ctx.fillPath()
-            } else {
-                ctx.fill(frrect)
-            }
+            if let roundedPath { ctx.addPath(roundedPath.cgPath); ctx.strokePath() } else { ctx.stroke(rrect) }
 
         case .number:
             guard item.points.count == 2 else { return }
@@ -557,6 +643,23 @@ open class AnnotationCanvasView: UIView {
             guard let img = item.overlayImage, item.points.count == 2 else { return }
             img.draw(in: rectFromPoints(item.points[0], item.points[1]))
 
+        case .polygon:
+            guard item.points.count == 2 else { return }
+            let verts = polygonVertices(in: rectFromPoints(item.points[0], item.points[1]),
+                                        sides: item.sides, isStar: item.isStar)
+            guard let first = verts.first else { return }
+            let path = UIBezierPath()
+            path.move(to: first)
+            for v in verts.dropFirst() { path.addLine(to: v) }
+            path.close()
+            if item.opacity > 0 {
+                ctx.addPath(path.cgPath)
+                ctx.setFillColor(item.color.withAlphaComponent(item.opacity).cgColor)
+                ctx.fillPath()
+            }
+            ctx.addPath(path.cgPath)
+            ctx.strokePath()
+
         case .select:
             break
         }
@@ -581,6 +684,22 @@ open class AnnotationCanvasView: UIView {
         let pt = touch.location(in: self)
         isTextResizeInteractionActive = false
         touchStartPoint = pt; didDragSignificantly = false; draggedPointIndex = nil
+
+        // "Velg flere"-modus: touch-ekvivalenten til Cmd+klikk/Cmd+dra på Mac.
+        // Et treff legger objektet til/fjerner det fra flervalget; tomt lerret
+        // starter et markeringsrektangel. Returnerer alltid herfra — resten av
+        // touchesBegan (frihånd/tekst/håndtak-sjekker) skal aldri nås mens
+        // denne modusen er på og Velg-verktøyet er aktivt.
+        if multiSelectMode, currentTool == .select {
+            if let idx = itemIndex(at: pt) {
+                toggleSelection(at: idx)
+            } else {
+                marqueeStart = pt
+                marqueeRect = CGRect(origin: pt, size: .zero)
+            }
+            setNeedsDisplay()
+            return
+        }
 
         if currentTool.isFreehandLike {
             if usesPencilKitForFreehand { return }
@@ -660,6 +779,11 @@ open class AnnotationCanvasView: UIView {
         guard let pt = touches.first?.location(in: self) else { return }
         if hypot(pt.x - touchStartPoint.x, pt.y - touchStartPoint.y) > 4 { didDragSignificantly = true }
 
+        if let start = marqueeStart {
+            marqueeRect = rectFromPoints(start, pt)
+            return
+        }
+
         if let idx = draggedItemIndex {
             if let ptIdx = draggedPointIndex {
                 if items[idx].tool == .image { applyImageCornerDrag(index: idx, cornerIndex: ptIdx, to: pt) }
@@ -684,7 +808,7 @@ open class AnnotationCanvasView: UIView {
         }
 
         switch currentTool {
-        case .arrow, .line, .circle, .rectangle, .filledCircle, .filledRect, .number:
+        case .arrow, .line, .circle, .rectangle, .number, .polygon:
             currentPoints = currentPoints.isEmpty ? [pt, pt] : [currentPoints[0], pt]
         case .freehand, .highlighter, .text, .image, .select, .paintBackground:
             break
@@ -695,6 +819,28 @@ open class AnnotationCanvasView: UIView {
     open override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let touch = touches.first else { return }
         let pt = touch.location(in: self)
+
+        // Fullfører en markering: velg alle objekter som overlapper området
+        // som ble dratt ut.
+        if let start = marqueeStart {
+            let rect = rectFromPoints(start, pt)
+            let hits = items.indices.filter { idx in
+                guard let r = itemBounds(items[idx]) else { return false }
+                return rect.intersects(r)
+            }
+            selectedIndices.formUnion(hits)
+            marqueeStart = nil
+            marqueeRect = nil
+            return
+        }
+        // Speiler "Velg flere"-sjekken i touchesBegan: den gjorde allerede
+        // jobben sin der (og returnerte tidlig uten å sette draggedItemIndex),
+        // så touchesEnded skal ikke falle gjennom til "fullfør en tegning"-
+        // fallbacken lenger ned — ellers lager den et nytt, usynlig
+        // `.select`-objekt på trykkpunktet og overtar valget.
+        if multiSelectMode, currentTool == .select {
+            return
+        }
 
         if let idx = draggedItemIndex {
             if let ptIdx = draggedPointIndex {
@@ -738,7 +884,7 @@ open class AnnotationCanvasView: UIView {
         }
 
         switch currentTool {
-        case .arrow, .line, .circle, .rectangle, .filledCircle, .filledRect, .number, .text, .image, .select, .freehand, .highlighter, .paintBackground:
+        case .arrow, .line, .circle, .rectangle, .number, .text, .image, .select, .freehand, .highlighter, .paintBackground, .polygon:
             currentPoints = currentPoints.isEmpty ? [pt, pt] : [currentPoints[0], pt]
         }
         if currentPoints.count >= 2 {
@@ -746,7 +892,8 @@ open class AnnotationCanvasView: UIView {
             items.append(AnnotationItem(tool: currentTool, color: currentColor,
                                         lineWidth: currentLineWidth, points: currentPoints,
                                         number: nextNum, opacity: currentFillOpacity,
-                                        cornerRadius: currentCornerRadius))
+                                        cornerRadius: currentCornerRadius,
+                                        sides: currentPolygonSides, isStar: currentPolygonIsStar))
             // Nyopprettet form forblir valgt, slik at farge/bredde/corner
             // radius/fyllingsgrad kan justeres med en gang — uten å måtte
             // bytte til "Velg"-verktøyet og trykke på formen manuelt først.
@@ -761,6 +908,8 @@ open class AnnotationCanvasView: UIView {
         draggedPointIndex = nil
         dragOffset = .zero
         activeFreehandStrokeIndex = nil
+        marqueeStart = nil
+        marqueeRect = nil
     }
 
     private func applyImageCornerDrag(index: Int, cornerIndex: Int, to pt: CGPoint) {
@@ -834,9 +983,15 @@ open class AnnotationCanvasView: UIView {
     }
 
     public func deleteSelected() {
-        guard let idx = selectedItemIndex else { return }
-        if activeFreehandStrokeIndex == idx { activeFreehandStrokeIndex = nil }
-        items.remove(at: idx); selectedItemIndex = nil; setNeedsDisplay()
+        guard !selectedIndices.isEmpty else { return }
+        if let active = activeFreehandStrokeIndex, selectedIndices.contains(active) {
+            activeFreehandStrokeIndex = nil
+        }
+        // Slett i synkende indeks-orden så tidligere fjerninger ikke forskyver
+        // indeksene til de som fortsatt gjenstår å slette.
+        for idx in selectedIndices.sorted(by: >) { items.remove(at: idx) }
+        selectedIndices = []
+        setNeedsDisplay()
     }
 
     public func undo() {
@@ -878,6 +1033,8 @@ public struct AnnotationDocument: Codable {
         public let overlayImageBase64: String?
         public let cornerRadius: Double?
         public let backgroundColor: [Double]?
+        public let sides: Int?
+        public let isStar: Bool?
     }
 
     public struct CodablePoint: Codable {
@@ -915,13 +1072,15 @@ extension AnnotationCanvasView {
                          opacity: Double(item.opacity),
                          overlayImageBase64: overlayB64,
                          cornerRadius: Double(item.cornerRadius),
-                         backgroundColor: bg)
+                         backgroundColor: bg,
+                         sides: item.sides,
+                         isStar: item.isStar)
         }
         let imgB64 = backgroundImage.flatMap { $0.jpegData(compressionQuality: 0.88) }?.base64EncodedString()
         let imgPxW = backgroundImage.flatMap { $0.cgImage.map { Double($0.width) } }
         let imgPxH = backgroundImage.flatMap { $0.cgImage.map { Double($0.height) } }
         let drawingB64 = pencilDrawingData?.base64EncodedString()
-        let doc = AnnotationDocument(version: 2,
+        let doc = AnnotationDocument(version: 3,
                                      canvasWidth: Double(bounds.width),
                                      canvasHeight: Double(bounds.height),
                                      imagePixelWidth: imgPxW,
@@ -936,8 +1095,17 @@ extension AnnotationCanvasView {
     @discardableResult
     public func loadDocument(_ data: Data) -> (UIImage?, Data?) {
         guard let doc = try? JSONDecoder().decode(AnnotationDocument.self, from: data) else { return (nil, nil) }
+        // Fyllingsgrad-tvangen til 0 skal KUN gjelde ekte gamle filer (skrevet
+        // før sirkel/rektangel/polygon fikk justerbar fylling) — fra og med
+        // versjon 3 skriver "circle"/"rectangle"/"polygon" ALLTID en reell
+        // fyllingsgrad, så uten denne versjonssjekken ville nyopprettede,
+        // faktisk fylte objekter fått fyllingen sin nullstilt igjen ved neste
+        // innlasting (siden verktøynavnet alene ikke lenger skiller dem fra
+        // gamle, aldri-fylte objekter).
+        let isLegacyDocument = doc.version < 3
         items = doc.items.compactMap { ci -> AnnotationItem? in
             guard let tool = toolFromString(ci.tool) else { return nil }
+            let opacity = (isLegacyDocument && legacyToolForcesZeroOpacity(ci.tool)) ? 0 : CGFloat(ci.opacity)
             let color: UIColor = ci.color.count == 4
                 ? UIColor(red: CGFloat(ci.color[0]), green: CGFloat(ci.color[1]),
                           blue: CGFloat(ci.color[2]), alpha: CGFloat(ci.color[3]))
@@ -957,9 +1125,10 @@ extension AnnotationCanvasView {
                                   points: pts, number: ci.number, text: ci.text,
                                   fontSize: CGFloat(ci.fontSize), fontName: ci.fontName,
                                   textWidth: ci.textWidth.map { CGFloat($0) },
-                                  opacity: CGFloat(ci.opacity), overlayImage: overlayImg,
+                                  opacity: opacity, overlayImage: overlayImg,
                                   cornerRadius: CGFloat(ci.cornerRadius ?? 0),
-                                  backgroundColor: bgColor)
+                                  backgroundColor: bgColor,
+                                  sides: ci.sides ?? 5, isStar: ci.isStar ?? false)
         }
 
         // Remap coordinates when loading on a different canvas size
@@ -1073,15 +1242,21 @@ extension AnnotationCanvasView {
         case .freehand: return "freehand"
         case .highlighter: return "highlighter"
         case .rectangle: return "rectangle"
-        case .filledCircle: return "filledCircle"
-        case .filledRect: return "filledRect"
         case .number: return "number"
         case .text: return "text"
         case .image: return "image"
         case .paintBackground: return "paintBackground"
+        case .polygon: return "polygon"
         }
     }
 
+    /// Eldre lagrede prosjekter kan ha "filledCircle"/"filledRect"/"filledPolygon"
+    /// som egne verktøy (før sirkel/rektangel/polygon fikk justerbar fyllingsgrad
+    /// på det samlede verktøyet) — mappes til det sammenslåtte verktøyet her.
+    /// `legacyToolForcesZeroOpacity` brukes av `loadDocument` til å vite at en
+    /// gammel IKKE-fylt sirkel/rektangel/polygon skal ha fyllingsgrad 0 uansett
+    /// hva som tilfeldigvis lå lagret i opacity-feltet (det ble aldri brukt til
+    /// noe for dem før nå).
     private func toolFromString(_ s: String) -> AnnotationTool? {
         switch s {
         case "select": return .select
@@ -1091,13 +1266,19 @@ extension AnnotationCanvasView {
         case "freehand": return .freehand
         case "highlighter": return .highlighter
         case "rectangle": return .rectangle
-        case "filledCircle": return .filledCircle
-        case "filledRect": return .filledRect
+        case "filledCircle": return .circle
+        case "filledRect": return .rectangle
         case "number": return .number
         case "text": return .text
         case "image": return .image
+        case "polygon": return .polygon
+        case "filledPolygon": return .polygon
         default: return nil
         }
+    }
+
+    private func legacyToolForcesZeroOpacity(_ s: String) -> Bool {
+        s == "circle" || s == "rectangle" || s == "polygon"
     }
 }
 
@@ -1113,5 +1294,13 @@ extension AnnotationCanvasView: UIContextMenuInteractionDelegate {
         if onContextMenuMac?(idx, location) == true { return nil }
         #endif
         return onContextMenu?(idx)
+    }
+}
+
+// MARK: - Apple Pencil dobbelttrykk
+
+extension AnnotationCanvasView: UIPencilInteractionDelegate {
+    public func pencilInteractionDidTap(_ interaction: UIPencilInteraction) {
+        onPencilDoubleTap?()
     }
 }

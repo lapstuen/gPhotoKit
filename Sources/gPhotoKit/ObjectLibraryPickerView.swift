@@ -67,7 +67,13 @@ struct ObjectLibraryPickerView: View {
                                     url: item.url,
                                     categories: allCategories,
                                     onTap: {
-                                        if let data = try? Data(contentsOf: item.url),
+                                        if item.url.pathExtension.lowercased() == "svg" {
+                                            guard let svgText = try? String(contentsOf: item.url, encoding: .utf8) else { return }
+                                            SVGRasterizer.render(svgText: svgText) { img in
+                                                guard let img else { return }
+                                                DispatchQueue.main.async { onSelect(img) }
+                                            }
+                                        } else if let data = try? Data(contentsOf: item.url),
                                            let img = UIImage(data: data) {
                                             onSelect(img)
                                         }
@@ -237,6 +243,15 @@ private struct ObjectCell: View {
             }
         }
         .onAppear {
+            if url.pathExtension.lowercased() == "svg" {
+                // WKWebView (i SVGRasterizer) må opprettes på hovedtråden.
+                guard let svgText = try? String(contentsOf: url, encoding: .utf8) else { return }
+                SVGRasterizer.render(svgText: svgText) { img in
+                    guard let img else { return }
+                    self.thumbnail = img
+                }
+                return
+            }
             DispatchQueue.global(qos: .userInitiated).async {
                 guard let data = try? Data(contentsOf: url),
                       let img = UIImage(data: data) else { return }

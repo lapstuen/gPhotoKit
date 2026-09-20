@@ -6,6 +6,9 @@ public enum ObjectLibrary {
 
     public static let uncategorizedCategory = "Uten kategori"
     private static let rootFolderName = "gPhotoObjects"
+    /// Filtyper som vises i biblioteket. SVG er ekte vektorgrafikk (rastreres
+    /// ved innsetting, se ImageAnnotationViewController), ikke bare et bilde.
+    private static let displayableExtensions: Set<String> = ["png", "svg"]
 
     public static var folder: URL {
         if let icloud = FileManager.default.url(forUbiquityContainerIdentifier: "iCloud.no.1955.gPhoto") {
@@ -73,7 +76,7 @@ public enum ObjectLibrary {
     public static func move(url: URL, to category: String?) -> URL? {
         let destDir = directory(for: category)
         let baseName = url.deletingPathExtension().lastPathComponent
-        let destURL = destDir.appendingPathComponent(uniqueFileName(baseName: baseName, in: destDir))
+        let destURL = destDir.appendingPathComponent(uniqueFileName(baseName: baseName, ext: url.pathExtension, in: destDir))
         guard destURL != url else { return url }
         guard (try? FileManager.default.moveItem(at: url, to: destURL)) != nil else { return nil }
         return destURL
@@ -161,19 +164,19 @@ public enum ObjectLibrary {
             includingPropertiesForKeys: [.creationDateKey],
             options: .skipsHiddenFiles
         ) else { return [] }
-        return items.filter { $0.pathExtension.lowercased() == "png" }
+        return items.filter { displayableExtensions.contains($0.pathExtension.lowercased()) }
     }
 
     private static func hasPNGFiles(in directory: URL) -> Bool {
         !pngFiles(in: directory).isEmpty
     }
 
-    private static func uniqueFileName(baseName: String, in directory: URL) -> String {
+    private static func uniqueFileName(baseName: String, ext: String = "png", in directory: URL) -> String {
         let fm = FileManager.default
-        var candidate = "\(baseName).png"
+        var candidate = "\(baseName).\(ext)"
         var counter = 1
         while fm.fileExists(atPath: directory.appendingPathComponent(candidate).path) {
-            candidate = "\(baseName)_\(counter).png"
+            candidate = "\(baseName)_\(counter).\(ext)"
             counter += 1
         }
         return candidate

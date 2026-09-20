@@ -357,10 +357,13 @@ open class ImageAnnotationViewController: UIViewController, PKCanvasViewDelegate
             self?.showTextInputVC(at: point)
         }
 
-        canvasView.onSelectionChanged = { [weak self] idx in
+        canvasView.onSelectionChanged = { [weak self] indices in
             guard let self else { return }
+            // Denne (eldre) editoren tilbyr ikke flervalg — `indices` har
+            // derfor alltid 0 eller 1 elementer i praksis.
+            let idx = indices.count == 1 ? indices.first : nil
             let hasTextSelected = idx.map { self.canvasView.items[$0].tool == .text } ?? false
-            let hasSelection = idx != nil
+            let hasSelection = !indices.isEmpty
             self.fontDecBtn.isHidden = !hasTextSelected
             self.fontIncBtn.isHidden = !hasTextSelected
             self.fontSeparator?.isHidden = !hasTextSelected
@@ -386,19 +389,29 @@ open class ImageAnnotationViewController: UIViewController, PKCanvasViewDelegate
                     self?.canvasView.deleteSelected()
                 },
             ]
-            if item.tool == .filledCircle || item.tool == .filledRect || item.tool == .number || item.tool == .highlighter {
+            if item.tool == .circle || item.tool == .rectangle || item.tool == .polygon || item.tool == .number || item.tool == .highlighter {
                 let opacityAction = UIAction(title: "",
                                              image: Self.opacityGradientImage(color: item.color)) { [weak self] _ in
                     self?.showOpacitySlider(for: idx)
                 }
                 actions.insert(opacityAction, at: 0)
             }
-            if item.tool == .rectangle || item.tool == .filledRect {
+            if item.tool == .rectangle {
                 let cornerAction = UIAction(title: "",
                                             image: UIImage(systemName: "rectangle.roundedtop")) { [weak self] _ in
                     self?.showCornerRadiusSlider(for: idx)
                 }
                 actions.insert(cornerAction, at: 0)
+            }
+            if item.tool == .polygon {
+                let sidesAction = UIAction(title: "", image: UIImage(systemName: "number")) { [weak self] _ in
+                    self?.showPolygonSidesSlider(for: idx)
+                }
+                actions.insert(sidesAction, at: 0)
+                let starAction = UIAction(title: "", image: UIImage(systemName: item.isStar ? "star.fill" : "star")) { [weak self] _ in
+                    self?.toggleStar(for: idx)
+                }
+                actions.insert(starAction, at: 0)
             }
             if item.tool == .image {
                 let bgAction = UIAction(title: "",
@@ -470,19 +483,29 @@ open class ImageAnnotationViewController: UIViewController, PKCanvasViewDelegate
                 self?.canvasView.deleteSelected()
             },
         ]
-        if item.tool == .filledCircle || item.tool == .filledRect || item.tool == .number || item.tool == .highlighter {
+        if item.tool == .circle || item.tool == .rectangle || item.tool == .polygon || item.tool == .number || item.tool == .highlighter {
             let opacityAction = UIAction(title: "",
                                          image: Self.opacityGradientImage(color: item.color)) { [weak self] _ in
                 self?.showOpacitySlider(for: itemIndex)
             }
             actions.insert(opacityAction, at: 0)
         }
-        if item.tool == .rectangle || item.tool == .filledRect {
+        if item.tool == .rectangle {
             let cornerAction = UIAction(title: "",
                                         image: UIImage(systemName: "rectangle.roundedtop")) { [weak self] _ in
                 self?.showCornerRadiusSlider(for: itemIndex)
             }
             actions.insert(cornerAction, at: 0)
+        }
+        if item.tool == .polygon {
+            let sidesAction = UIAction(title: "", image: UIImage(systemName: "number")) { [weak self] _ in
+                self?.showPolygonSidesSlider(for: itemIndex)
+            }
+            actions.insert(sidesAction, at: 0)
+            let starAction = UIAction(title: "", image: UIImage(systemName: item.isStar ? "star.fill" : "star")) { [weak self] _ in
+                self?.toggleStar(for: itemIndex)
+            }
+            actions.insert(starAction, at: 0)
         }
         if item.tool == .image {
             let bgAction = UIAction(title: "",
@@ -532,14 +555,22 @@ open class ImageAnnotationViewController: UIViewController, PKCanvasViewDelegate
 
         var actions: [MacContextMenuVC.Action] = []
 
-        if item.tool == .filledCircle || item.tool == .filledRect || item.tool == .number || item.tool == .highlighter {
+        if item.tool == .circle || item.tool == .rectangle || item.tool == .polygon || item.tool == .number || item.tool == .highlighter {
             actions.append(.init(symbol: "paintbucket", destructive: false) { [weak self] in
                 self?.showOpacitySlider(for: idx)
             })
         }
-        if item.tool == .rectangle || item.tool == .filledRect {
+        if item.tool == .rectangle {
             actions.append(.init(symbol: "rectangle.roundedtop", destructive: false) { [weak self] in
                 self?.showCornerRadiusSlider(for: idx)
+            })
+        }
+        if item.tool == .polygon {
+            actions.append(.init(symbol: "number", destructive: false) { [weak self] in
+                self?.showPolygonSidesSlider(for: idx)
+            })
+            actions.append(.init(symbol: item.isStar ? "star.fill" : "star", destructive: false) { [weak self] in
+                self?.toggleStar(for: idx)
             })
         }
         if item.tool == .text {
@@ -625,11 +656,11 @@ open class ImageAnnotationViewController: UIViewController, PKCanvasViewDelegate
         return v
     }
 
-    private let toolMap: [AnnotationTool] = [.select, .freehand, .highlighter, .line, .arrow, .circle, .filledCircle, .rectangle, .filledRect, .number, .text]
-        private let toolSymbols = ["cursorarrow", "pencil", "highlighter", "pencil.and.scribble", "arrow.up.right", "circle", "circle.fill",
-                               "rectangle", "rectangle.fill", "number.circle.fill", "textformat"]
-    private let toolNames   = ["Velg", "Frihånd", "Markering", "Linje", "Pil", "Sirkel", "Fylt sirkel",
-                               "Rektangel", "Fylt rekt.", "Nummer", "Tekst"]
+    private let toolMap: [AnnotationTool] = [.select, .freehand, .highlighter, .line, .arrow, .circle, .rectangle, .number, .text, .polygon]
+    private let toolSymbols = ["cursorarrow", "pencil", "highlighter", "pencil.and.scribble", "arrow.up.right", "circle",
+                               "rectangle", "number.circle.fill", "textformat", "pentagon"]
+    private let toolNames   = ["Velg", "Frihånd", "Markering", "Linje", "Pil", "Sirkel",
+                               "Rektangel", "Nummer", "Tekst", "Polygon"]
 
     private let availableFonts: [(display: String, name: String)] = [
         ("System Fet",              "bold"),
@@ -898,9 +929,10 @@ open class ImageAnnotationViewController: UIViewController, PKCanvasViewDelegate
             return
         }
 
-        // Merkepenn trenger begge kontrollene (bredde OG fyllingsgrad), i motsetning til
-        // de andre verktøyene som bare trenger én av dem — la brukeren velge hvilken.
-        if effectiveTool == .highlighter {
+        // Merkepenn/sirkel/rektangel trenger begge kontrollene (bredde OG
+        // fyllingsgrad), i motsetning til de andre verktøyene som bare trenger
+        // én av dem — la brukeren velge hvilken.
+        if effectiveTool == .highlighter || effectiveTool == .circle || effectiveTool == .rectangle {
             #if targetEnvironment(macCatalyst)
             // Samme fix som toolPickerButtonTapped — se kommentar der:
             // UIAlertController(.actionSheet) rendres horisontalt på Mac Catalyst.
@@ -939,7 +971,59 @@ open class ImageAnnotationViewController: UIViewController, PKCanvasViewDelegate
             return
         }
 
-        let isOpacity = [AnnotationTool.filledCircle, .filledRect, .number].contains(effectiveTool)
+        // Polygon trenger tre kontroller (strektykkelse, fyllingsgrad, pluss
+        // antall hjørner og stjerne-av/på) — samme valgsheet-mønster som
+        // Merkepenn/sirkel/rektangel over, bare med to ekstra valg.
+        if effectiveTool == .polygon {
+            #if targetEnvironment(macCatalyst)
+            let actions: [MacActionListVC.Action] = [
+                .init(symbol: "line.3.horizontal", title: "Strektykkelse", destructive: false) { [weak self] in
+                    self?.presentLineWidthPopover(from: sender)
+                },
+                .init(symbol: "circle.lefthalf.filled", title: "Gjennomsiktighet", destructive: false) { [weak self] in
+                    self?.presentOpacityPopover(from: sender)
+                },
+                .init(symbol: "number", title: "Antall hjørner", destructive: false) { [weak self] in
+                    self?.presentPolygonSidesPopover(from: sender)
+                },
+                .init(symbol: "star", title: "Stjerne", destructive: false) { [weak self] in
+                    self?.togglePolygonStar()
+                },
+            ]
+            let vc = MacActionListVC(actions: actions, cancelTitle: "Lukk")
+            vc.modalPresentationStyle = .popover
+            if let pop = vc.popoverPresentationController {
+                pop.sourceView = sender
+                pop.sourceRect = sender.bounds
+                pop.permittedArrowDirections = .any
+                pop.delegate = vc
+            }
+            present(vc, animated: false)
+            #else
+            let sheet = UIAlertController(title: nil, message: nil, preferredStyle: .actionSheet)
+            sheet.addAction(UIAlertAction(title: "Strektykkelse", style: .default) { [weak self] _ in
+                self?.presentLineWidthPopover(from: sender)
+            })
+            sheet.addAction(UIAlertAction(title: "Gjennomsiktighet", style: .default) { [weak self] _ in
+                self?.presentOpacityPopover(from: sender)
+            })
+            sheet.addAction(UIAlertAction(title: "Antall hjørner", style: .default) { [weak self] _ in
+                self?.presentPolygonSidesPopover(from: sender)
+            })
+            sheet.addAction(UIAlertAction(title: "Stjerne", style: .default) { [weak self] _ in
+                self?.togglePolygonStar()
+            })
+            sheet.addAction(UIAlertAction(title: "Avbryt", style: .cancel))
+            if let pop = sheet.popoverPresentationController {
+                pop.sourceView = sender
+                pop.sourceRect = sender.bounds
+            }
+            present(sheet, animated: true)
+            #endif
+            return
+        }
+
+        let isOpacity = effectiveTool == .number
         if isOpacity {
             presentOpacityPopover(from: sender)
         } else {
@@ -999,6 +1083,49 @@ open class ImageAnnotationViewController: UIViewController, PKCanvasViewDelegate
         present(vc, animated: true)
     }
 
+    private func presentPolygonSidesPopover(from sender: UIView) {
+        let currentSides: Int
+        if let idx = canvasView.selectedItemIndex, idx < canvasView.items.count {
+            currentSides = canvasView.items[idx].sides
+        } else {
+            currentSides = canvasView.currentPolygonSides
+        }
+        let vc = SliderPickerPopoverVC(
+            title: "Antall hjørner",
+            min: 3, max: 12,
+            value: Float(currentSides),
+            format: { "\(Int($0))" }
+        )
+        vc.onChange = { [weak self] v in
+            guard let self else { return }
+            let sides = Int(v)
+            self.canvasView.currentPolygonSides = sides
+            if let idx = self.canvasView.selectedItemIndex, idx < self.canvasView.items.count {
+                self.canvasView.items[idx].sides = sides
+                self.canvasView.setNeedsDisplay()
+            }
+        }
+        vc.modalPresentationStyle = .popover
+        if let pop = vc.popoverPresentationController {
+            pop.sourceView = sender
+            pop.sourceRect = sender.bounds
+            pop.permittedArrowDirections = [.up, .down]
+            pop.delegate = vc
+        }
+        present(vc, animated: true)
+    }
+
+    private func togglePolygonStar() {
+        if let idx = canvasView.selectedItemIndex, idx < canvasView.items.count {
+            let newValue = !canvasView.items[idx].isStar
+            canvasView.items[idx].isStar = newValue
+            canvasView.currentPolygonIsStar = newValue
+            canvasView.setNeedsDisplay()
+        } else {
+            canvasView.currentPolygonIsStar.toggle()
+        }
+    }
+
     private func showOpacitySlider(for idx: Int) {
         guard idx < canvasView.items.count else { return }
         let vc = SliderPickerPopoverVC(
@@ -1045,6 +1172,39 @@ open class ImageAnnotationViewController: UIViewController, PKCanvasViewDelegate
             pop.delegate = vc
         }
         present(vc, animated: true)
+    }
+
+    private func showPolygonSidesSlider(for idx: Int) {
+        guard idx < canvasView.items.count else { return }
+        let vc = SliderPickerPopoverVC(
+            title: "Antall hjørner",
+            min: 3, max: 12,
+            value: Float(canvasView.items[idx].sides),
+            format: { "\(Int($0))" }
+        )
+        vc.onChange = { [weak self] v in
+            guard let self, idx < self.canvasView.items.count else { return }
+            let sides = Int(v)
+            self.canvasView.items[idx].sides = sides
+            self.canvasView.currentPolygonSides = sides
+            self.canvasView.setNeedsDisplay()
+        }
+        vc.modalPresentationStyle = .popover
+        if let pop = vc.popoverPresentationController {
+            pop.sourceView = canvasView
+            pop.sourceRect = CGRect(x: canvasView.bounds.midX, y: canvasView.bounds.midY, width: 0, height: 0)
+            pop.permittedArrowDirections = .any
+            pop.delegate = vc
+        }
+        present(vc, animated: true)
+    }
+
+    private func toggleStar(for idx: Int) {
+        guard idx < canvasView.items.count else { return }
+        let newValue = !canvasView.items[idx].isStar
+        canvasView.items[idx].isStar = newValue
+        canvasView.currentPolygonIsStar = newValue
+        canvasView.setNeedsDisplay()
     }
 
     private func showCurrentToolSlider(isOpacity: Bool, from src: UIView?) {
@@ -1832,8 +1992,13 @@ open class ImageAnnotationViewController: UIViewController, PKCanvasViewDelegate
                     c.restoreGState()
 
                 case .circle:
+                    let ecr = exportRect(pts)
+                    if item.opacity > 0 {
+                        c.setFillColor(item.color.withAlphaComponent(item.opacity).cgColor)
+                        c.fillEllipse(in: ecr)
+                    }
                     c.setLineWidth(lw); c.setStrokeColor(item.color.cgColor)
-                    c.strokeEllipse(in: exportRect(pts))
+                    c.strokeEllipse(in: ecr)
 
                 case .line:
                     c.setLineWidth(lw); c.setStrokeColor(item.color.cgColor)
@@ -1849,24 +2014,14 @@ open class ImageAnnotationViewController: UIViewController, PKCanvasViewDelegate
                     c.move(to: e); c.addLine(to: CGPoint(x: e.x - hl*cos(ang+ha), y: e.y - hl*sin(ang+ha))); c.strokePath()
 
                 case .rectangle:
-                    c.setLineWidth(lw); c.setStrokeColor(item.color.cgColor)
                     let er = exportRect(pts)
-                    if item.cornerRadius > 0 {
-                        let path = UIBezierPath(roundedRect: er, cornerRadius: item.cornerRadius * sx)
-                        c.addPath(path.cgPath); c.strokePath()
-                    } else { c.stroke(er) }
-
-                case .filledCircle:
-                    c.setFillColor(item.color.withAlphaComponent(item.opacity).cgColor)
-                    c.fillEllipse(in: exportRect(pts))
-
-                case .filledRect:
-                    c.setFillColor(item.color.withAlphaComponent(item.opacity).cgColor)
-                    let efr = exportRect(pts)
-                    if item.cornerRadius > 0 {
-                        let path = UIBezierPath(roundedRect: efr, cornerRadius: item.cornerRadius * sx)
-                        c.addPath(path.cgPath); c.fillPath()
-                    } else { c.fill(efr) }
+                    let roundedPath: UIBezierPath? = item.cornerRadius > 0 ? UIBezierPath(roundedRect: er, cornerRadius: item.cornerRadius * sx) : nil
+                    if item.opacity > 0 {
+                        c.setFillColor(item.color.withAlphaComponent(item.opacity).cgColor)
+                        if let roundedPath { c.addPath(roundedPath.cgPath); c.fillPath() } else { c.fill(er) }
+                    }
+                    c.setLineWidth(lw); c.setStrokeColor(item.color.cgColor)
+                    if let roundedPath { c.addPath(roundedPath.cgPath); c.strokePath() } else { c.stroke(er) }
 
                 case .number:
                     let r = exportRect(pts)
@@ -1897,6 +2052,23 @@ open class ImageAnnotationViewController: UIViewController, PKCanvasViewDelegate
                 case .image:
                     guard let img = item.overlayImage, pts.count >= 2 else { continue }
                     img.draw(in: exportRect(pts))
+
+                case .polygon:
+                    guard pts.count >= 2 else { continue }
+                    let verts = polygonVertices(in: exportRect(pts), sides: item.sides, isStar: item.isStar)
+                    guard let first = verts.first else { continue }
+                    let path = UIBezierPath()
+                    path.move(to: first)
+                    for v in verts.dropFirst() { path.addLine(to: v) }
+                    path.close()
+                    if item.opacity > 0 {
+                        c.addPath(path.cgPath)
+                        c.setFillColor(item.color.withAlphaComponent(item.opacity).cgColor)
+                        c.fillPath()
+                    }
+                    c.addPath(path.cgPath)
+                    c.setLineWidth(lw); c.setStrokeColor(item.color.cgColor)
+                    c.strokePath()
 
                 case .select:
                     break
@@ -3120,7 +3292,7 @@ extension ImageAnnotationViewController: UIContextMenuInteractionDelegate {
                                        configurationForMenuAtLocation location: CGPoint) -> UIContextMenuConfiguration? {
         let toolIndex = interaction.view?.tag ?? -1
         let contextTool = (toolIndex >= 0 && toolIndex < toolMap.count) ? toolMap[toolIndex] : canvasView.currentTool
-        let isOpacity = [AnnotationTool.filledCircle, .filledRect, .number, .highlighter].contains(contextTool)
+        let isOpacity = [AnnotationTool.number, .highlighter].contains(contextTool)
         let src = interaction.view
         let icon  = isOpacity ? "circle.lefthalf.filled" : "lineweight"
         let action = UIAction(title: "", image: UIImage(systemName: icon)) { [weak self] _ in
